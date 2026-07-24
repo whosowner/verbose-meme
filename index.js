@@ -1,5 +1,5 @@
 // index.js
-// Discord Bot: AutoRole + ModMail (thread-based) + Express keep-alive
+// Discord Bot: AutoRole + ModMail (thread-based, with close button) + Express keep-alive
 // Config: GUILD_ID, MODMAIL_CHANNEL_ID, AUTOROLE_ID set below (not env)
 // Only TOKEN comes from .env
 
@@ -10,7 +10,10 @@ const {
   Partials,
   ChannelType,
   EmbedBuilder,
-  ActivityType
+  ActivityType,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle
 } = require('discord.js');
 const express = require('express');
 
@@ -31,28 +34,61 @@ const client = new Client({
     GatewayIntentBits.DirectMessages,
     GatewayIntentBits.MessageContent
   ],
-  partials: [Partials.Channel, Partials.Message]
+  partials: [Partials.Channel, Partials.Message, Partials.User, Partials.GuildMember]
 });
 
 // Map to track userId -> threadId for modmail
 const modmailThreads = new Map();
 
-client.once('ready', () => {
-  console.log(`Logged in as ${client.user.tag}`);
-
+// ==================== ACTIVITY (never dies) ====================
+function setActivity() {
+  if (!client.user) return;
   client.user.setPresence({
     activities: [{ name: 'DMs for support | ModMail', type: ActivityType.Watching }],
     status: 'online'
   });
+}
+
+client.once('ready', () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  setActivity();
+  // Discord/gateway sometimes clears presence after a while — reapply on an interval
+  setInterval(setActivity, 5 * 60 * 1000); // every 5 minutes
 });
+
+// Presence can get wiped when the gateway reconnects; reapply then too
+client.on('shardResume', setActivity);
+client.on('shardReady', setActivity);
 
 // ==================== AUTOROLE ====================
 client.on('guildMemberAdd', async (member) => {
-  if (member.guild.id !== GUILD_ID) return;
   try {
-    await member.roles.add(AUTOROLE_ID);
+    if (!member.guild || member.guild.id !== GUILD_ID) return;
+
+    // Fetch the role fresh to make sure cache isn't stale/empty
+    const role = member.guild.roles.cache.get(AUTOROLE_ID)
+      || await member.guild.roles.fetch(AUTOROLE_ID).catch(() => null);
+
+    if (!role) {
+      console.error(`Autorole failed: role ${AUTOROLE_ID} not found in guild ${member.guild.id}`);
+      return;
+    }
+
+    // Check bot has ManageRoles and role is below bot's highest role
+    const me = member.guild.members.me;
+    if (!me || !me.permissions.has('ManageRoles')) {
+      console.error('Autorole failed: bot is missing Manage Roles permission');
+      return;
+    }
+    if (role.position >= me.roles.highest.position) {
+      console.error('Autorole failed: bot role is not above the autorole in the role hierarchy');
+      return;
+    }
+
+    await member.roles.add(role, 'Autorole on join');
+    console.log(`Assigned autorole to ${member.user.tag}`);
   } catch (err) {
-    console.error('Failed to assign autorole:', err.message);
+    console.error('Failed to assign autorole:', err);
   }
 });
 
@@ -84,7 +120,15 @@ client.on('messageCreate', async (message) => {
         .setDescription(`From: <@${message.author.id}> (${message.author.tag})`)
         .setColor('Blue')
         .setTimestamp();
-      await thread.send({ embeds: [infoEmbed] });
+
+      const closeRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`modmail_close_${message.author.id}`)
+          .setLabel('Close Thread')
+          .setStyle(ButtonStyle.Danger)
+      );
+
+      await thread.send({ embeds: [infoEmbed], components: [closeRow] });
     }
 
     const embed = new EmbedBuilder()
@@ -100,7 +144,7 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  // Reply inside modmail thread -> forward to user DM
+  // Reply inside modmail thread -> forward to user DM (staff identity hidden)
   if (message.channel.isThread() && message.channel.parentId === MODMAIL_CHANNEL_ID) {
     const userId = [...modmailThreads.entries()].find(([, tId]) => tId === message.channel.id)?.[0];
     if (!userId) return;
@@ -109,7 +153,7 @@ client.on('messageCreate', async (message) => {
     if (!user) return;
 
     const embed = new EmbedBuilder()
-      .setAuthor({ name: `Staff (${message.author.tag})`, iconURL: message.author.displayAvatarURL() })
+      .setAuthor({ name: 'Staff', iconURL: message.guild.iconURL() || undefined })
       .setDescription(message.content || '*(no content)*')
       .setColor('Orange')
       .setTimestamp();
@@ -118,6 +162,33 @@ client.on('messageCreate', async (message) => {
     await user.send({ embeds: [embed], files }).catch(() => {
       message.reply('Could not DM the user. They may have DMs disabled.');
     });
+  }
+});
+
+// ==================== BUTTON HANDLER (close modmail) ====================
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isButton()) return;
+  if (!interaction.customId.startsWith('modmail_close_')) return;
+
+  const userId = interaction.customId.replace('modmail_close_', '');
+
+  await interaction.reply({ content: 'Closing this modmail thread...', ephemeral: true });
+
+  const user = await client.users.fetch(userId).catch(() => null);
+  if (user) {
+    const closedEmbed = new EmbedBuilder()
+      .setTitle('ModMail Closed')
+      .setDescription('This support thread has been closed by staff. Message us again to open a new one.')
+      .setColor('Red')
+      .setTimestamp();
+    await user.send({ embeds: [closedEmbed] }).catch(() => {});
+  }
+
+  modmailThreads.delete(userId);
+
+  if (interaction.channel && interaction.channel.isThread()) {
+    await interaction.channel.setLocked(true).catch(() => {});
+    await interaction.channel.setArchived(true).catch(() => {});
   }
 });
 
